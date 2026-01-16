@@ -50,13 +50,13 @@ class TrainingConfig:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
 
-# config
+# このファイルでconfigの実体をもつ
 config = TrainingConfig(
     dataset_root='data',
     batch_size=8,
     num_workers=4,
     learning_rate=1e-4,
-    num_epochs = 50,
+    num_epochs = 30,
     image_size=(480, 640),
     in_channels=3,
 

@@ -22,14 +22,14 @@ logger.setLevel(logging.INFO)
 
 # mask image
 class MaskImage(nn.Module):
-    def __init__(self, image_size=(480, 640), patch_size=(40, 40), mask_ratio=0.5):
+    def __init__(self, image_size=(480, 640), patch_size=(40, 40), mask_ratio=0.5, device="cpu"):
         super().__init__()
         self.mask_ratio = mask_ratio
         self.image_size = image_size
         self.patch_size = patch_size
         self.patch_num = (image_size[0] // patch_size[0], image_size[1] // patch_size[1])
         self.patch_len = self.patch_num[0] * self.patch_num[1]
-        self.mask = nn.Parameter(torch.randn((1, 1, 1, patch_size[0], patch_size[1])))  # (1, 1, 1, patch_H, patch_W)
+        self.mask = nn.Parameter(torch.randn((1, 1, 1, patch_size[0], patch_size[1]), device=device))  # (1, 1, 1, patch_H, patch_W)
 
     def forward(self, image: torch.Tensor):
         """
@@ -40,18 +40,22 @@ class MaskImage(nn.Module):
             image (torch.Tensor): (B, C, H, W)
         """
         b, c, h, w = image.size()
-        remain_N = int(self.patch_len * (1 - self.mask_ratio))
 
         # パッチ化する -> (b, c, num_patches_H, num_patches_W, patch_H, patch_W)
         image_patch = image.reshape((b, c, self.patch_num[0], self.patch_size[0], self.patch_num[1], self.patch_size[1]))
         image_patch = image_patch.permute(0, 1, 2, 4, 3, 5).flatten(2, 3)
 
         # マスクする
-        random = torch.rand((b, c, self.patch_num[0], self.patch_size[0], self.patch_num[1], self.patch_size[1]))
+        random = torch.rand((b, c, self.patch_num[0], self.patch_size[0], self.patch_num[1], self.patch_size[1]), device=image.device)
+        random = random.permute(0, 1, 2, 4, 3, 5).flatten(2, 3)
+
         masker = (random < self.mask_ratio).float()  # 1: masked, 0: visible
-        masked_image = (1 - masker) * image + masker * self.mask
-        masked_image = masked_image.permute(0, 1, 2, 4, 3, 5).reshape(b, c, h, w)
-        return masked_image, masker
+        masked_row_patches = (1 - masker) * image_patch + masker * self.mask
+        masked_patched_image = masked_row_patches.reshape((b, c, self.patch_num[0], self.patch_num[1], self.patch_size[0], self.patch_size[1]))
+        masked_image = masked_patched_image.permute(0, 1, 2, 4, 3, 5).reshape(b, c, h, w)
+
+        mask_tensor = (random < self.mask_ratio).float().reshape(b, c, h, w)
+        return masked_image, mask_tensor
 
 
 # make a model
@@ -75,12 +79,11 @@ class SimMiM(nn.Module):
         """
         b, c, h, w = masked_image.size()
         outputs = self.encoder(masked_image, output_hidden_states=True).hidden_states
-        f1 = self.linear1(outputs[0])
-        f2 = self.linear2(outputs[1])
-        f3 = self.linear3(outputs[2])
-        f4 = self.linear4(outputs[3])
+        f1 = self.upsample(self.linear1(outputs[0]))
+        f2 = self.upsample(self.linear2(outputs[1]))
+        f3 = self.upsample(self.linear3(outputs[2]))
+        f4 = self.upsample(self.linear4(outputs[3]))
         pred = self.final_linear(torch.cat((f1, f2, f3, f4), dim=1))
-        pred = self.upsample(pred)
         return pred
 
 
@@ -114,7 +117,10 @@ class NYUv2(Dataset):
         img_names.sort()
 
         hha_dir = Path(self.root / self.split / 'hha')
+        print(f"{len(img_names)=}")
         self.hha = [Path(hha_dir / name) for name in img_names]
+
+        self.const = torch.Tensor([218.0, 255.0, 255.0]).reshape((3, 1, 1))  # calc_const.pyで導いた。const_value.pklに保存
 
     @property
     def transform(self):
@@ -125,10 +131,9 @@ class NYUv2(Dataset):
         ])
 
     def __getitem__(self, idx):
-        hha = Image.open(self.hha[idx])
+        hha = np.array(Image.open(self.hha[idx]))
         # (C, H, W)の形でラップする
-        const = torch.Tensor([218.0, 255.0, 255.0])  # calc_const.pyで導いた。const_value.pklに保存
-        hha = torch.from_numpy(hha).permute(2, 0, 1) / const
+        hha = torch.from_numpy(hha).permute(2, 0, 1) / self.const
         hha = self.transform(hha)
         return hha
 
@@ -142,6 +147,7 @@ class Trainer:
         self.model = model.to(device)
         self.config = config
         self.optimizer = optimizer
+        self.mask_image = MaskImage(self.config.image_size, self.config.patch_size, device=device)
 
     def train_one_epoch(self, dataloader: DataLoader, mode: str):
         if mode == "train":
@@ -151,14 +157,13 @@ class Trainer:
         else:
             raise ValueError("mode must be train or valid")
         total_loss = 0
-        mask_image = MaskImage(self.config.image_size, self.config.patch_size)
         for batch in tqdm(dataloader, desc="学習しています"):
             batch = batch.to(self.config.device)
-            masked_batch, mask_tensor = mask_image(batch)
+            masked_batch, mask_tensor = self.mask_image(batch)
             num_masks = mask_tensor.sum()
             pred: torch.Tensor = self.model(masked_batch)
             loss = calc_loss(batch, pred, mask_tensor, num_masks)
-            total_loss += loss
+            total_loss += loss.item()
 
             if mode == "train":
                 self.optimizer.zero_grad()
@@ -182,7 +187,7 @@ class Trainer:
             total_train_loss += train_loss
 
             total_train_losses.append(total_train_loss)
-            if total_train_losses[-1] > total_train_losses[-2] * 0.99:
+            if epoch > 10 and total_train_losses[-1] > total_train_losses[-2] * 0.99:
                 if early_finish_cnt == 0:
                     logger.info("""total_valid_loss didn't make a big improvement.
                                 Finish fitting when there's almost no improvement in next 5 epochs""")
@@ -197,25 +202,30 @@ class Trainer:
                 early_finish_cnt = 0
             logger.info(f"Epoch {epoch} / {self.config.num_epochs} has been finished.")
         logger.info("finished fitting")
+        self.save_weights()
         return None
 
     def save_weights(self):
         date = str(datetime.datetime.now())[:10]
         file_name = f"{date}-simmim_weights.pt"
-        torch.save(self.model, file_name)
+        torch.save(self.model.state_dict(), file_name)
         logger.info(f"weights are saved at {file_name}")
 
 
 if __name__ == "__main__":
-    nyuv2_dataset = NYUv2(root="./data", config=config, split="train")
-    model = SimMiM(
-        config.depth_model,
-        config.dims,
-        config.decoder_hiddim,
-        config.image_size
-    )
-    optimizer = optim.AdamW(model.parameters(), lr=0.001)
+    logging.basicConfig(level=logging.INFO)
+    logger.info("hello")
+    # nyuv2_dataset = NYUv2(root="./data", config=config, split="train")
+    # print(len(nyuv2_dataset))
+    # model = SimMiM(
+    #     config.depth_model,
+    #     config.dims,
+    #     config.decoder_hiddim,
+    #     config.image_size
+    # )
+    # optimizer = optim.AdamW(model.parameters(), lr=0.001)
 
-    trainer = Trainer(model, optimizer, config, "cpu")
-    trainer.fit(dataset=nyuv2_dataset)
-    logger.info("all processes are successfully finished")
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    # trainer = Trainer(model, optimizer, config, device)
+    # trainer.fit(dataset=nyuv2_dataset)
+    # logger.info("all processes are successfully finished")
